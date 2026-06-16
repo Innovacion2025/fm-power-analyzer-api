@@ -2444,6 +2444,73 @@ app.get("/api/v1/ingest/notification-config", async (req, res) => {
 });
 
 // ============================================================
+// BLOQUE 12.2: POST /api/v1/ingest/connectivity-event (V1.5)
+//
+// Recibe eventos de conectividad desde Node-RED (pm_offline,
+// pm_recovered, device_timeout, device_timeout_repeat,
+// device_recovered) y envía la notificación Telegram centralizada.
+// Centraliza toda la lógica de notificación en Servicio B, quitando
+// la dependencia de `notification_config` en el flow context de Node-RED.
+// ============================================================
+app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
+  const internalKey = req.headers["x-internal-key"];
+  if (!internalKey || internalKey !== process.env.INTERNAL_API_KEY) {
+    return res.status(401).json({ error: "no_autorizado" });
+  }
+
+  const { device_id, tipo, pm_slave, pm_name, device_name, timestamp } = req.body || {};
+  if (!device_id || !tipo) {
+    return res.status(400).json({ error: "faltan_campos", required: ["device_id", "tipo"] });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT organization_id FROM gateways WHERE device_id = $1 LIMIT 1",
+      [device_id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: "device_no_registrado" });
+    }
+    const organizationId = rows[0].organization_id;
+
+    const fecha = new Date(timestamp || Date.now());
+    const hora = fecha.toLocaleString("es-EC", {
+      timeZone: "America/Guayaquil",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+    });
+
+    let mensaje = "";
+    switch (tipo) {
+      case "pm_offline":
+        mensaje = `⚠️ PM OFFLINE\nDevice: ${device_id}\nPM: ${pm_slave}\nNombre: ${pm_name || "N/A"}\nHora: ${hora}`;
+        break;
+      case "pm_recovered":
+        mensaje = `✅ PM RECUPERADO\nDevice: ${device_id}\nPM: ${pm_slave}\nNombre: ${pm_name || "N/A"}\nHora: ${hora}`;
+        break;
+      case "device_timeout":
+        mensaje = `🚨 DEVICE CAÍDO\nDevice: ${device_id}\nHora: ${hora}`;
+        break;
+      case "device_timeout_repeat":
+        mensaje = `🔁 DEVICE SIGUE CAÍDO\nDevice: ${device_id}\nHora: ${hora}`;
+        break;
+      case "device_recovered":
+        mensaje = `✅ DEVICE RECUPERADO\nDevice: ${device_id}\nHora: ${hora}`;
+        break;
+      default:
+        mensaje = `ℹ️ Evento ${tipo}\nDevice: ${device_id}\nHora: ${hora}`;
+    }
+
+    await notificarTelegram(organizationId, mensaje);
+    console.log(`[EVENT] ${tipo} — device=${device_id} pm=${pm_slave ?? "-"}`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[EVENT] /connectivity-event error:", e.message);
+    res.status(500).json({ error: "error_interno" });
+  }
+});
+
+// ============================================================
 // BLOQUE 13: EVALUADOR DE ALARMAS (V1.4)
 //
 // Corre cada ALARM_EVAL_INTERVAL_MS (default 2 min) vía setInterval.
