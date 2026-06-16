@@ -2505,7 +2505,7 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
         mensaje = `ℹ️ Evento ${tipo}\nDevice: ${device_id}\nHora: ${hora}`;
     }
 
-    await notificarTelegram(organizationId, mensaje);
+    await dispatch(organizationId, null, mensaje);
     console.log(`[EVENT] ${tipo} — device=${device_id} pm=${pm_slave ?? "-"}`);
     res.json({ ok: true });
   } catch (e) {
@@ -2543,40 +2543,92 @@ const ALARM_VARIABLES_PERMITIDAS = new Set([
   "desbalance_v", "desbalance_i",
 ]);
 
-async function notificarTelegram(organizationId, mensaje) {
-  try {
-    const { rows } = await pool.query(
-      "SELECT telegram_bot_token, telegram_chat_id FROM notification_channels WHERE organization_id = $1",
-      [organizationId]
-    );
-    if (!rows.length || !rows[0].telegram_bot_token || !rows[0].telegram_chat_id) return;
+// ---- Dispatcher V1.6: multi-canal (Telegram + Webhook) ----
 
-    const token  = rows[0].telegram_bot_token;
-    const chatId = rows[0].telegram_chat_id;
-    const body   = JSON.stringify({ chat_id: chatId, text: mensaje });
-
-    await new Promise((resolve) => {
-      const req = https.request(
-        {
-          hostname: "api.telegram.org",
-          path: `/bot${token}/sendMessage`,
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Content-Length": Buffer.byteLength(body),
-          },
+async function enviarTelegram(token, chatId, mensaje) {
+  const body = JSON.stringify({ chat_id: chatId, text: mensaje });
+  await new Promise((resolve) => {
+    const req = https.request(
+      {
+        hostname: "api.telegram.org",
+        path: `/bot${token}/sendMessage`,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
         },
-        (res) => { res.resume(); resolve(); }
+      },
+      (res) => { res.resume(); resolve(); }
+    );
+    req.on("error", (e) => { console.error("[NOTIF] Telegram error:", e.message); resolve(); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function enviarWebhook(webhookUrl, mensaje, organizationId) {
+  const parsed = new URL(webhookUrl);
+  const body = JSON.stringify({ text: mensaje, organization_id: organizationId });
+  await new Promise((resolve) => {
+    const mod = parsed.protocol === "https:" ? https : require("http");
+    const req = mod.request(
+      {
+        hostname: parsed.hostname,
+        path: parsed.pathname + (parsed.search || ""),
+        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (res) => { res.resume(); resolve(); }
+    );
+    req.on("error", (e) => { console.error("[NOTIF] Webhook error:", e.message); resolve(); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// dispatch(organizationId, alarmRuleId, mensaje)
+// - alarmRuleId !== null: envía a los canales vinculados via notification_targets.
+//   Si la regla no tiene targets, cae al fallback de org.
+// - alarmRuleId === null: fallback directo (eventos de conectividad).
+// Fallback: todos los canales habilitados de la organización.
+async function dispatch(organizationId, alarmRuleId, mensaje) {
+  try {
+    let canales = [];
+
+    if (alarmRuleId) {
+      const { rows } = await pool.query(
+        `SELECT nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
+         FROM notification_channels nc
+         JOIN notification_targets nt ON nt.channel_id = nc.id
+         WHERE nt.alarm_rule_id = $1 AND nc.enabled = true`,
+        [alarmRuleId]
       );
-      req.on("error", (e) => {
-        console.error("[ALARM] Telegram error:", e.message);
-        resolve();
-      });
-      req.write(body);
-      req.end();
-    });
+      canales = rows;
+    }
+
+    if (!canales.length) {
+      const { rows } = await pool.query(
+        `SELECT channel_type, telegram_bot_token, telegram_chat_id, webhook_url
+         FROM notification_channels
+         WHERE organization_id = $1 AND enabled = true`,
+        [organizationId]
+      );
+      canales = rows;
+    }
+
+    for (const ch of canales) {
+      if (ch.channel_type === "telegram" && ch.telegram_bot_token && ch.telegram_chat_id) {
+        await enviarTelegram(ch.telegram_bot_token, ch.telegram_chat_id, mensaje);
+      } else if (ch.channel_type === "webhook" && ch.webhook_url) {
+        await enviarWebhook(ch.webhook_url, mensaje, organizationId);
+      }
+    }
   } catch (e) {
-    console.error("[ALARM] notificarTelegram error:", e.message);
+    console.error("[NOTIF] dispatch error:", e.message);
   }
 }
 
@@ -2637,7 +2689,7 @@ async function evaluarAlarmas() {
           `⚠️ ALARMA: ${regla.name}\n` +
           `Medidor: ${regla.device_id} / PM ${regla.pm_slave}\n` +
           `${regla.variable} ${regla.operator} ${umbral} — valor actual: ${valor}`;
-        await notificarTelegram(regla.organization_id, msg);
+        await dispatch(regla.organization_id, regla.id, msg);
 
         await pool.query(
           "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
