@@ -2465,7 +2465,7 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      `SELECT s.organization_id
+      `SELECT g.id AS gateway_id, s.organization_id
        FROM gateways g
        JOIN sites s ON s.id = g.site_id
        WHERE g.device_id = $1
@@ -2475,7 +2475,7 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
     if (!rows.length) {
       return res.status(404).json({ error: "device_no_registrado" });
     }
-    const organizationId = rows[0].organization_id;
+    const { gateway_id: gatewayId, organization_id: organizationId } = rows[0];
 
     const fecha = new Date(timestamp || Date.now());
     const hora = fecha.toLocaleString("es-EC", {
@@ -2505,7 +2505,7 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
         mensaje = `ℹ️ Evento ${tipo}\nDevice: ${device_id}\nHora: ${hora}`;
     }
 
-    await dispatch(organizationId, null, mensaje);
+    await dispatch(organizationId, { gatewayId }, mensaje);
     console.log(`[EVENT] ${tipo} — device=${device_id} pm=${pm_slave ?? "-"}`);
     res.json({ ok: true });
   } catch (e) {
@@ -2590,12 +2590,16 @@ async function enviarWebhook(webhookUrl, mensaje, organizationId) {
   });
 }
 
-// dispatch(organizationId, alarmRuleId, mensaje)
-// - alarmRuleId !== null: envía a los canales vinculados via notification_targets.
-//   Si la regla no tiene targets, cae al fallback de org.
-// - alarmRuleId === null: fallback directo (eventos de conectividad).
-// Fallback: todos los canales habilitados de la organización.
-async function dispatch(organizationId, alarmRuleId, mensaje) {
+// dispatch(organizationId, { alarmRuleId, gatewayId }, mensaje)
+//
+// Orden de resolución de canales:
+//   1. Si alarmRuleId → notification_targets WHERE alarm_rule_id = ?
+//   2. Si gatewayId   → notification_targets WHERE gateway_id = ?
+//   3. Fallback       → todos los canales habilitados de la organización
+//
+// El fallback garantiza que las reglas/gateways sin targets configurados
+// sigan notificando (comportamiento pre-V1.6).
+async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null } = {}, mensaje) {
   try {
     let canales = [];
 
@@ -2606,6 +2610,15 @@ async function dispatch(organizationId, alarmRuleId, mensaje) {
          JOIN notification_targets nt ON nt.channel_id = nc.id
          WHERE nt.alarm_rule_id = $1 AND nc.enabled = true`,
         [alarmRuleId]
+      );
+      canales = rows;
+    } else if (gatewayId) {
+      const { rows } = await pool.query(
+        `SELECT nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
+         FROM notification_channels nc
+         JOIN notification_targets nt ON nt.channel_id = nc.id
+         WHERE nt.gateway_id = $1 AND nc.enabled = true`,
+        [gatewayId]
       );
       canales = rows;
     }
@@ -2689,7 +2702,7 @@ async function evaluarAlarmas() {
           `⚠️ ALARMA: ${regla.name}\n` +
           `Medidor: ${regla.device_id} / PM ${regla.pm_slave}\n` +
           `${regla.variable} ${regla.operator} ${umbral} — valor actual: ${valor}`;
-        await dispatch(regla.organization_id, regla.id, msg);
+        await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msg);
 
         await pool.query(
           "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
