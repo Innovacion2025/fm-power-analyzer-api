@@ -2465,7 +2465,11 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      "SELECT organization_id FROM gateways WHERE device_id = $1 LIMIT 1",
+      `SELECT s.organization_id
+       FROM gateways g
+       JOIN sites s ON s.id = g.site_id
+       WHERE g.device_id = $1
+       LIMIT 1`,
       [device_id]
     );
     if (!rows.length) {
