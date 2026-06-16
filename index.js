@@ -10,6 +10,7 @@
 // ============================================================
 const crypto = require("crypto");
 const fs = require("fs");
+const https = require("https");
 const path = require("path");
 const express = require("express");
 const { Pool } = require("pg");
@@ -2443,6 +2444,149 @@ app.get("/api/v1/ingest/notification-config", async (req, res) => {
 });
 
 // ============================================================
+// BLOQUE 13: EVALUADOR DE ALARMAS (V1.4)
+//
+// Corre cada ALARM_EVAL_INTERVAL_MS (default 2 min) vía setInterval.
+// Lee alarm_rules habilitadas, compara el valor actual en power_latest,
+// crea alarm_events al disparar y los resuelve cuando la condición
+// deja de cumplirse. Notifica vía Telegram al disparar.
+//
+// La interpolación de `rule.variable` en SQL es segura: el CHECK
+// constraint de alarm_rules.variable garantiza que solo son nombres
+// válidos de columnas de power_latest. ALARM_VARIABLES_PERMITIDAS
+// agrega una segunda capa de validación en JS.
+// ============================================================
+
+const ALARM_EVAL_INTERVAL_MS = parseInt(process.env.ALARM_EVAL_INTERVAL_MS || "120000", 10);
+
+const ALARM_VARIABLES_PERMITIDAS = new Set([
+  "voltage_a", "voltage_b", "voltage_c",
+  "current_a", "current_b", "current_c", "current_n",
+  "p_a", "p_b", "p_c", "p_tot",
+  "q_a", "q_b", "q_c", "q_tot",
+  "s_a", "s_b", "s_c", "s_tot",
+  "pf_a", "pf_b", "pf_c", "pf_tot",
+  "frecuencia", "active_energy",
+  "thd_va", "thd_vb", "thd_vc",
+  "thd_ia", "thd_ib", "thd_ic", "thd_in",
+  "desbalance_v", "desbalance_i",
+]);
+
+async function notificarTelegram(organizationId, mensaje) {
+  try {
+    const { rows } = await pool.query(
+      "SELECT telegram_bot_token, telegram_chat_id FROM notification_channels WHERE organization_id = $1",
+      [organizationId]
+    );
+    if (!rows.length || !rows[0].telegram_bot_token || !rows[0].telegram_chat_id) return;
+
+    const token  = rows[0].telegram_bot_token;
+    const chatId = rows[0].telegram_chat_id;
+    const body   = JSON.stringify({ chat_id: chatId, text: mensaje });
+
+    await new Promise((resolve) => {
+      const req = https.request(
+        {
+          hostname: "api.telegram.org",
+          path: `/bot${token}/sendMessage`,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+          },
+        },
+        (res) => { res.resume(); resolve(); }
+      );
+      req.on("error", (e) => {
+        console.error("[ALARM] Telegram error:", e.message);
+        resolve();
+      });
+      req.write(body);
+      req.end();
+    });
+  } catch (e) {
+    console.error("[ALARM] notificarTelegram error:", e.message);
+  }
+}
+
+async function evaluarAlarmas() {
+  try {
+    const { rows: reglas } = await pool.query(`
+      SELECT
+        ar.id,
+        ar.organization_id,
+        ar.meter_id,
+        ar.name,
+        ar.variable,
+        ar.operator,
+        ar.threshold,
+        m.pm_slave,
+        g.device_id
+      FROM alarm_rules ar
+      JOIN meters m ON m.id = ar.meter_id
+      JOIN gateways g ON g.id = m.gateway_id
+      WHERE ar.enabled = true
+    `);
+
+    for (const regla of reglas) {
+      if (!ALARM_VARIABLES_PERMITIDAS.has(regla.variable)) continue;
+
+      const { rows: latest } = await pool.query(
+        `SELECT ${regla.variable} AS valor FROM power_latest WHERE device_id = $1 AND pm_slave = $2 LIMIT 1`,
+        [regla.device_id, regla.pm_slave]
+      );
+
+      if (!latest.length || latest[0].valor === null) continue;
+
+      const valor  = parseFloat(latest[0].valor);
+      const umbral = parseFloat(regla.threshold);
+      if (isNaN(valor) || isNaN(umbral)) continue;
+
+      let condicion = false;
+      if (regla.operator === ">")  condicion = valor > umbral;
+      if (regla.operator === "<")  condicion = valor < umbral;
+      if (regla.operator === ">=") condicion = valor >= umbral;
+      if (regla.operator === "<=") condicion = valor <= umbral;
+
+      const { rows: abiertos } = await pool.query(
+        "SELECT id FROM alarm_events WHERE alarm_rule_id = $1 AND resolved_at IS NULL LIMIT 1",
+        [regla.id]
+      );
+      const hayAbierto = abiertos.length > 0;
+
+      if (condicion && !hayAbierto) {
+        await pool.query(
+          `INSERT INTO alarm_events (alarm_rule_id, organization_id, meter_id, variable, value_at_trigger)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [regla.id, regla.organization_id, regla.meter_id, regla.variable, valor]
+        );
+        console.log(`[ALARM] Disparo — ${regla.name}: ${regla.variable} ${regla.operator} ${umbral} (valor: ${valor})`);
+
+        const msg =
+          `⚠️ ALARMA: ${regla.name}\n` +
+          `Medidor: ${regla.device_id} / PM ${regla.pm_slave}\n` +
+          `${regla.variable} ${regla.operator} ${umbral} — valor actual: ${valor}`;
+        await notificarTelegram(regla.organization_id, msg);
+
+        await pool.query(
+          "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
+          [regla.id]
+        );
+
+      } else if (!condicion && hayAbierto) {
+        await pool.query(
+          "UPDATE alarm_events SET resolved_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
+          [regla.id]
+        );
+        console.log(`[ALARM] Resuelto — ${regla.name}: ${regla.variable} volvio a ${valor} (umbral: ${regla.operator} ${umbral})`);
+      }
+    }
+  } catch (e) {
+    console.error("[ALARM] evaluarAlarmas error:", e.message);
+  }
+}
+
+// ============================================================
 // BLOQUE 14: INICIO DEL SERVIDOR
 // ============================================================
 async function iniciar() {
@@ -2456,4 +2600,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log("API corriendo en puerto " + PORT);
   await iniciar();
+  evaluarAlarmas();
+  setInterval(evaluarAlarmas, ALARM_EVAL_INTERVAL_MS);
+  console.log(`Evaluador de alarmas activo (cada ${ALARM_EVAL_INTERVAL_MS / 1000}s)`);
 });
