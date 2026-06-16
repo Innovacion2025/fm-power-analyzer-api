@@ -855,6 +855,10 @@ app.post("/api/save-reading", async (req, res) => {
     await upsertMeter(data);
     await upsertLatest(data);
 
+    // Evaluar alarmas del device en tiempo real con el payload recién recibido.
+    // No bloquea la respuesta al gateway (fire-and-forget con captura de errores).
+    evaluarAlarmasParaDevice(data.device_id, data.pm_slave, data.payload || {}).catch(() => {});
+
     const SAVE_INTERVAL = 2000;
 
     if (!global.lastSaveTimes) {
@@ -2645,19 +2649,93 @@ async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null }
   }
 }
 
+// Evalúa una sola regla con el valor provisto (ya leído de power_latest).
+// Si valor es null, solo resuelve eventos abiertos (lectura sin dato eléctrico).
+async function evaluarRegla(regla, valor) {
+  const umbral = parseFloat(regla.threshold);
+  if (isNaN(umbral)) return;
+
+  let condicion = false;
+  if (valor !== null && !isNaN(valor)) {
+    if (regla.operator === ">")  condicion = valor > umbral;
+    if (regla.operator === "<")  condicion = valor < umbral;
+    if (regla.operator === ">=") condicion = valor >= umbral;
+    if (regla.operator === "<=") condicion = valor <= umbral;
+  }
+
+  const { rows: abiertos } = await pool.query(
+    "SELECT id FROM alarm_events WHERE alarm_rule_id = $1 AND resolved_at IS NULL LIMIT 1",
+    [regla.id]
+  );
+  const hayAbierto = abiertos.length > 0;
+
+  if (condicion && !hayAbierto) {
+    await pool.query(
+      `INSERT INTO alarm_events (alarm_rule_id, organization_id, meter_id, variable, value_at_trigger)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [regla.id, regla.organization_id, regla.meter_id, regla.variable, valor]
+    );
+    console.log(`[ALARM] Disparo — ${regla.name}: ${regla.variable} ${regla.operator} ${umbral} (valor: ${valor})`);
+
+    const msg =
+      `⚠️ ALARMA: ${regla.name}\n` +
+      `Medidor: ${regla.device_id} / PM ${regla.pm_slave}\n` +
+      `${regla.variable} ${regla.operator} ${umbral} — valor actual: ${valor}`;
+    await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msg);
+
+    await pool.query(
+      "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
+      [regla.id]
+    );
+
+  } else if (!condicion && hayAbierto) {
+    await pool.query(
+      "UPDATE alarm_events SET resolved_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
+      [regla.id]
+    );
+    console.log(`[ALARM] Resuelto — ${regla.name}: ${regla.variable} volvio a ${valor} (umbral: ${regla.operator} ${umbral})`);
+  }
+}
+
+// Evalúa solo las reglas del device_id/pm_slave que acaba de reportar.
+// Se llama desde /api/save-reading con el payload ya disponible en memoria,
+// sin releer power_latest (el valor recién escrito se pasa directamente).
+async function evaluarAlarmasParaDevice(deviceId, pmSlave, payload) {
+  try {
+    const { rows: reglas } = await pool.query(`
+      SELECT
+        ar.id, ar.organization_id, ar.meter_id, ar.name,
+        ar.variable, ar.operator, ar.threshold,
+        m.pm_slave, g.device_id
+      FROM alarm_rules ar
+      JOIN meters m ON m.id = ar.meter_id
+      JOIN gateways g ON g.id = m.gateway_id
+      WHERE ar.enabled = true
+        AND g.device_id = $1
+        AND m.pm_slave = $2
+    `, [deviceId, pmSlave]);
+
+    for (const regla of reglas) {
+      if (!ALARM_VARIABLES_PERMITIDAS.has(regla.variable)) continue;
+      const raw = payload[regla.variable];
+      const valor = (raw !== undefined && raw !== null) ? parseFloat(raw) : null;
+      await evaluarRegla(regla, valor);
+    }
+  } catch (e) {
+    console.error("[ALARM] evaluarAlarmasParaDevice error:", e.message);
+  }
+}
+
+// Sweeper global: evalúa todas las reglas habilitadas leyendo power_latest.
+// Corre cada ALARM_EVAL_INTERVAL_MS como red de seguridad (cold starts,
+// reglas creadas mientras no llegaban lecturas del device, etc.).
 async function evaluarAlarmas() {
   try {
     const { rows: reglas } = await pool.query(`
       SELECT
-        ar.id,
-        ar.organization_id,
-        ar.meter_id,
-        ar.name,
-        ar.variable,
-        ar.operator,
-        ar.threshold,
-        m.pm_slave,
-        g.device_id
+        ar.id, ar.organization_id, ar.meter_id, ar.name,
+        ar.variable, ar.operator, ar.threshold,
+        m.pm_slave, g.device_id
       FROM alarm_rules ar
       JOIN meters m ON m.id = ar.meter_id
       JOIN gateways g ON g.id = m.gateway_id
@@ -2672,50 +2750,9 @@ async function evaluarAlarmas() {
         [regla.device_id, regla.pm_slave]
       );
 
-      if (!latest.length || latest[0].valor === null) continue;
-
-      const valor  = parseFloat(latest[0].valor);
-      const umbral = parseFloat(regla.threshold);
-      if (isNaN(valor) || isNaN(umbral)) continue;
-
-      let condicion = false;
-      if (regla.operator === ">")  condicion = valor > umbral;
-      if (regla.operator === "<")  condicion = valor < umbral;
-      if (regla.operator === ">=") condicion = valor >= umbral;
-      if (regla.operator === "<=") condicion = valor <= umbral;
-
-      const { rows: abiertos } = await pool.query(
-        "SELECT id FROM alarm_events WHERE alarm_rule_id = $1 AND resolved_at IS NULL LIMIT 1",
-        [regla.id]
-      );
-      const hayAbierto = abiertos.length > 0;
-
-      if (condicion && !hayAbierto) {
-        await pool.query(
-          `INSERT INTO alarm_events (alarm_rule_id, organization_id, meter_id, variable, value_at_trigger)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [regla.id, regla.organization_id, regla.meter_id, regla.variable, valor]
-        );
-        console.log(`[ALARM] Disparo — ${regla.name}: ${regla.variable} ${regla.operator} ${umbral} (valor: ${valor})`);
-
-        const msg =
-          `⚠️ ALARMA: ${regla.name}\n` +
-          `Medidor: ${regla.device_id} / PM ${regla.pm_slave}\n` +
-          `${regla.variable} ${regla.operator} ${umbral} — valor actual: ${valor}`;
-        await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msg);
-
-        await pool.query(
-          "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
-          [regla.id]
-        );
-
-      } else if (!condicion && hayAbierto) {
-        await pool.query(
-          "UPDATE alarm_events SET resolved_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
-          [regla.id]
-        );
-        console.log(`[ALARM] Resuelto — ${regla.name}: ${regla.variable} volvio a ${valor} (umbral: ${regla.operator} ${umbral})`);
-      }
+      const raw = latest.length ? latest[0].valor : null;
+      const valor = (raw !== null && raw !== undefined) ? parseFloat(raw) : null;
+      await evaluarRegla(regla, valor);
     }
   } catch (e) {
     console.error("[ALARM] evaluarAlarmas error:", e.message);
