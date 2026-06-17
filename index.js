@@ -2488,7 +2488,6 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
       hour: "2-digit", minute: "2-digit", second: "2-digit",
     });
 
-    const isRecovery = tipo === "pm_recovered" || tipo === "device_recovered";
     const cVars = {
       device_id,
       device_name: device_name || device_id,
@@ -2498,11 +2497,21 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
       tipo,
     };
     const templates = await getTemplates();
-    const tmplKey = isRecovery ? "connectivity_recovery" : "connectivity_alert";
-    const mensaje = interpolar(
-      templates[tmplKey] || (isRecovery ? DEFAULT_CONNECTIVITY_RECOVERY_TEMPLATE : DEFAULT_CONNECTIVITY_ALERT_TEMPLATE),
-      cVars
-    );
+
+    let tmplKey, defaultTmpl;
+    if (tipo === "device_timeout" || tipo === "device_timeout_repeat") {
+      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;
+    } else if (tipo === "device_recovered") {
+      tmplKey = "device_recovery"; defaultTmpl = DEFAULT_DEVICE_RECOVERY_TEMPLATE;
+    } else if (tipo === "pm_offline") {
+      tmplKey = "pm_alert";        defaultTmpl = DEFAULT_PM_ALERT_TEMPLATE;
+    } else if (tipo === "pm_recovered") {
+      tmplKey = "pm_recovery";     defaultTmpl = DEFAULT_PM_RECOVERY_TEMPLATE;
+    } else {
+      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;
+    }
+
+    const mensaje = interpolar(templates[tmplKey] || defaultTmpl, cVars);
 
     await dispatch(organizationId, { gatewayId }, mensaje);
     console.log(`[EVENT] ${tipo} — device=${device_id} pm=${pm_slave ?? "-"}`);
@@ -2601,11 +2610,17 @@ const DEFAULT_REMINDER_TEMPLATE =
   "Medidor: {{device_id}} / PM {{pm}}\n" +
   "{{variable}} {{operador}} {{umbral}} — valor actual: {{valor}}";
 
-const DEFAULT_CONNECTIVITY_ALERT_TEMPLATE =
-  "⚠️ Sin señal: {{device_name}} ({{device_id}})\nPM: {{pm_name}} — {{hora}}";
+const DEFAULT_DEVICE_ALERT_TEMPLATE =
+  "⚠️ Equipo sin señal: {{device_name}} ({{device_id}}) — {{hora}}";
 
-const DEFAULT_CONNECTIVITY_RECOVERY_TEMPLATE =
-  "✅ Reconectado: {{device_name}} ({{device_id}})\nPM: {{pm_name}} — {{hora}}";
+const DEFAULT_DEVICE_RECOVERY_TEMPLATE =
+  "✅ Equipo en línea: {{device_name}} ({{device_id}}) — {{hora}}";
+
+const DEFAULT_PM_ALERT_TEMPLATE =
+  "⚠️ PM offline: {{pm_name}} (PM {{pm}}) — {{device_name}} — {{hora}}";
+
+const DEFAULT_PM_RECOVERY_TEMPLATE =
+  "✅ PM en línea: {{pm_name}} (PM {{pm}}) — {{device_name}} — {{hora}}";
 
 // Caché de plantillas globales (se refresca cada 5 min).
 let _templatesCache = null;
@@ -2629,13 +2644,17 @@ async function getTemplates() {
 // Reemplaza {{variable}} en la plantilla con los valores del objeto vars.
 function interpolar(template, vars) {
   return template
-    .replace(/\{\{nombre\}\}/g,    String(vars.nombre    ?? ""))
-    .replace(/\{\{variable\}\}/g,  String(vars.variable  ?? ""))
-    .replace(/\{\{valor\}\}/g,     String(vars.valor     ?? ""))
-    .replace(/\{\{umbral\}\}/g,    String(vars.umbral    ?? ""))
-    .replace(/\{\{operador\}\}/g,  String(vars.operador  ?? ""))
-    .replace(/\{\{device_id\}\}/g, String(vars.device_id ?? ""))
-    .replace(/\{\{pm\}\}/g,        String(vars.pm        ?? ""));
+    .replace(/\{\{nombre\}\}/g,      String(vars.nombre      ?? ""))
+    .replace(/\{\{variable\}\}/g,    String(vars.variable    ?? ""))
+    .replace(/\{\{valor\}\}/g,       String(vars.valor       ?? ""))
+    .replace(/\{\{umbral\}\}/g,      String(vars.umbral      ?? ""))
+    .replace(/\{\{operador\}\}/g,    String(vars.operador    ?? ""))
+    .replace(/\{\{device_id\}\}/g,   String(vars.device_id   ?? ""))
+    .replace(/\{\{device_name\}\}/g, String(vars.device_name ?? ""))
+    .replace(/\{\{pm\}\}/g,          String(vars.pm          ?? ""))
+    .replace(/\{\{pm_name\}\}/g,     String(vars.pm_name     ?? ""))
+    .replace(/\{\{hora\}\}/g,        String(vars.hora        ?? ""))
+    .replace(/\{\{tipo\}\}/g,        String(vars.tipo        ?? ""));
 }
 
 // dispatch(organizationId, { alarmRuleId, gatewayId }, mensaje)
