@@ -2595,22 +2595,46 @@ async function enviarWebhook(webhookUrl, mensaje, organizationId) {
   });
 }
 
-// dispatch(organizationId, { alarmRuleId, gatewayId }, mensaje)
+// Plantillas por defecto (usadas cuando el canal no tiene plantilla personalizada).
+const DEFAULT_ALARM_TEMPLATE =
+  "⚠️ ALARMA: {{nombre}}\n" +
+  "Medidor: {{device_id}} / PM {{pm}}\n" +
+  "{{variable}} {{operador}} {{umbral}} — valor actual: {{valor}}";
+
+const DEFAULT_REMINDER_TEMPLATE =
+  "🔔 RECORDATORIO — Alarma activa: {{nombre}}\n" +
+  "Medidor: {{device_id}} / PM {{pm}}\n" +
+  "{{variable}} {{operador}} {{umbral}} — valor actual: {{valor}}";
+
+// Reemplaza {{variable}} en la plantilla con los valores del objeto vars.
+function interpolar(template, vars) {
+  return template
+    .replace(/\{\{nombre\}\}/g,    String(vars.nombre    ?? ""))
+    .replace(/\{\{variable\}\}/g,  String(vars.variable  ?? ""))
+    .replace(/\{\{valor\}\}/g,     String(vars.valor     ?? ""))
+    .replace(/\{\{umbral\}\}/g,    String(vars.umbral    ?? ""))
+    .replace(/\{\{operador\}\}/g,  String(vars.operador  ?? ""))
+    .replace(/\{\{device_id\}\}/g, String(vars.device_id ?? ""))
+    .replace(/\{\{pm\}\}/g,        String(vars.pm        ?? ""));
+}
+
+// dispatch(organizationId, { alarmRuleId, gatewayId }, mensaje, { type, templateVars })
 //
 // Orden de resolución de canales:
 //   1. Si alarmRuleId → notification_targets WHERE alarm_rule_id = ?
 //   2. Si gatewayId   → notification_targets WHERE gateway_id = ?
 //   3. Fallback       → todos los canales habilitados de la organización
 //
-// El fallback garantiza que las reglas/gateways sin targets configurados
-// sigan notificando (comportamiento pre-V1.6).
-async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null } = {}, mensaje) {
+// Si se pasan templateVars, cada canal usa su propia plantilla (msg_alarm_template /
+// msg_reminder_template) si la tiene; de lo contrario usa mensaje como texto literal.
+async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null } = {}, mensaje, { type = "alarm", templateVars = null } = {}) {
   try {
     let canales = [];
+    const tmplCols = "nc.msg_alarm_template, nc.msg_reminder_template,";
 
     if (alarmRuleId) {
       const { rows } = await pool.query(
-        `SELECT nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
+        `SELECT ${tmplCols} nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
          FROM notification_channels nc
          JOIN notification_targets nt ON nt.channel_id = nc.id
          WHERE nt.alarm_rule_id = $1 AND nc.enabled = true`,
@@ -2619,7 +2643,7 @@ async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null }
       canales = rows;
     } else if (gatewayId) {
       const { rows } = await pool.query(
-        `SELECT nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
+        `SELECT ${tmplCols} nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
          FROM notification_channels nc
          JOIN notification_targets nt ON nt.channel_id = nc.id
          WHERE nt.gateway_id = $1 AND nc.enabled = true`,
@@ -2630,7 +2654,8 @@ async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null }
 
     if (!canales.length) {
       const { rows } = await pool.query(
-        `SELECT channel_type, telegram_bot_token, telegram_chat_id, webhook_url
+        `SELECT msg_alarm_template, msg_reminder_template,
+                channel_type, telegram_bot_token, telegram_chat_id, webhook_url
          FROM notification_channels
          WHERE organization_id = $1 AND enabled = true`,
         [organizationId]
@@ -2639,10 +2664,18 @@ async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null }
     }
 
     for (const ch of canales) {
+      let msg = mensaje;
+      if (templateVars) {
+        const tmpl = type === "reminder"
+          ? (ch.msg_reminder_template || DEFAULT_REMINDER_TEMPLATE)
+          : (ch.msg_alarm_template    || DEFAULT_ALARM_TEMPLATE);
+        msg = interpolar(tmpl, templateVars);
+      }
+
       if (ch.channel_type === "telegram" && ch.telegram_bot_token && ch.telegram_chat_id) {
-        await enviarTelegram(ch.telegram_bot_token, ch.telegram_chat_id, mensaje);
+        await enviarTelegram(ch.telegram_bot_token, ch.telegram_chat_id, msg);
       } else if (ch.channel_type === "webhook" && ch.webhook_url) {
-        await enviarWebhook(ch.webhook_url, mensaje, organizationId);
+        await enviarWebhook(ch.webhook_url, msg, organizationId);
       }
     }
   } catch (e) {
@@ -2678,11 +2711,8 @@ async function evaluarRegla(regla, valor) {
     );
     console.log(`[ALARM] Disparo — ${regla.name}: ${regla.variable} ${regla.operator} ${umbral} (valor: ${valor})`);
 
-    const msg =
-      `⚠️ ALARMA: ${regla.name}\n` +
-      `Medidor: ${regla.device_id} / PM ${regla.pm_slave}\n` +
-      `${regla.variable} ${regla.operator} ${umbral} — valor actual: ${valor}`;
-    await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msg);
+    const tVars = { nombre: regla.name, variable: regla.variable, valor, umbral, operador: regla.operator, device_id: regla.device_id, pm: regla.pm_slave };
+    await dispatch(regla.organization_id, { alarmRuleId: regla.id }, null, { type: "alarm", templateVars: tVars });
 
     await pool.query(
       "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
@@ -2708,11 +2738,8 @@ async function evaluarRegla(regla, valor) {
       : ALARM_RENOTIF_INTERVAL_MS;
 
     if (elapsed >= renotifMs) {
-      const msg =
-        `🔔 RECORDATORIO — Alarma activa: ${regla.name}\n` +
-        `Medidor: ${regla.device_id} / PM ${regla.pm_slave}\n` +
-        `${regla.variable} ${regla.operator} ${umbral} — valor actual: ${valor}`;
-      await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msg);
+      const tVars = { nombre: regla.name, variable: regla.variable, valor, umbral, operador: regla.operator, device_id: regla.device_id, pm: regla.pm_slave };
+      await dispatch(regla.organization_id, { alarmRuleId: regla.id }, null, { type: "reminder", templateVars: tVars });
       await pool.query(
         "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
         [regla.id]
