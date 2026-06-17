@@ -2532,7 +2532,8 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
 // agrega una segunda capa de validación en JS.
 // ============================================================
 
-const ALARM_EVAL_INTERVAL_MS = parseInt(process.env.ALARM_EVAL_INTERVAL_MS || "120000", 10);
+const ALARM_EVAL_INTERVAL_MS  = parseInt(process.env.ALARM_EVAL_INTERVAL_MS  || "120000",  10);
+const ALARM_RENOTIF_INTERVAL_MS = parseInt(process.env.ALARM_RENOTIF_INTERVAL_MS || "900000", 10); // 15 min default
 
 const ALARM_VARIABLES_PERMITIDAS = new Set([
   "voltage_a", "voltage_b", "voltage_c",
@@ -2687,6 +2688,37 @@ async function evaluarRegla(regla, valor) {
       "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
       [regla.id]
     );
+
+  } else if (condicion && hayAbierto) {
+    // Condición sigue activa — re-notificar si pasó más del intervalo configurado en el canal.
+    const { rows: ev } = await pool.query(
+      "SELECT notified_at FROM alarm_events WHERE alarm_rule_id = $1 AND resolved_at IS NULL LIMIT 1",
+      [regla.id]
+    );
+    const lastNotif = ev[0]?.notified_at;
+    const elapsed = lastNotif ? Date.now() - new Date(lastNotif).getTime() : Infinity;
+
+    // Leer intervalo desde la DB (MIN entre canales activos de la org); fallback al env var.
+    const { rows: chRows } = await pool.query(
+      "SELECT MIN(renotif_interval_minutes) AS minutes FROM notification_channels WHERE organization_id = $1 AND enabled = true",
+      [regla.organization_id]
+    );
+    const renotifMs = chRows[0]?.minutes != null
+      ? chRows[0].minutes * 60 * 1000
+      : ALARM_RENOTIF_INTERVAL_MS;
+
+    if (elapsed >= renotifMs) {
+      const msg =
+        `🔔 RECORDATORIO — Alarma activa: ${regla.name}\n` +
+        `Medidor: ${regla.device_id} / PM ${regla.pm_slave}\n` +
+        `${regla.variable} ${regla.operator} ${umbral} — valor actual: ${valor}`;
+      await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msg);
+      await pool.query(
+        "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
+        [regla.id]
+      );
+      console.log(`[ALARM] Recordatorio — ${regla.name}: ${regla.variable} sigue ${regla.operator} ${umbral} (valor: ${valor})`);
+    }
 
   } else if (!condicion && hayAbierto) {
     await pool.query(
