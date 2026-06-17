@@ -2729,7 +2729,7 @@ async function evaluarRegla(regla, valor) {
     );
 
   } else if (condicion && hayAbierto) {
-    // Condición sigue activa — re-notificar si pasó más del intervalo configurado en el canal.
+    // Condición sigue activa — re-notificar si pasó el intervalo global (configurado por super_admin).
     const { rows: ev } = await pool.query(
       "SELECT notified_at FROM alarm_events WHERE alarm_rule_id = $1 AND resolved_at IS NULL LIMIT 1",
       [regla.id]
@@ -2737,18 +2737,11 @@ async function evaluarRegla(regla, valor) {
     const lastNotif = ev[0]?.notified_at;
     const elapsed = lastNotif ? Date.now() - new Date(lastNotif).getTime() : Infinity;
 
-    // Leer intervalo desde la DB (MIN entre canales activos de la org); fallback al env var.
-    const { rows: chRows } = await pool.query(
-      "SELECT MIN(renotif_interval_minutes) AS minutes FROM notification_channels WHERE organization_id = $1 AND enabled = true",
-      [regla.organization_id]
-    );
-    const renotifMs = chRows[0]?.minutes != null
-      ? chRows[0].minutes * 60 * 1000
-      : ALARM_RENOTIF_INTERVAL_MS;
+    const templates = await getTemplates();
+    const renotifMs = parseInt(templates.renotif_interval_minutes || "15", 10) * 60 * 1000;
 
     if (elapsed >= renotifMs) {
       const tVars = { nombre: regla.name, variable: regla.variable, valor, umbral, operador: regla.operator, device_id: regla.device_id, pm: regla.pm_slave };
-      const templates = await getTemplates();
       const msgReminder = interpolar(templates.reminder || DEFAULT_REMINDER_TEMPLATE, tVars);
       await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msgReminder);
       await pool.query(
