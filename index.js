@@ -2622,6 +2622,157 @@ const DEFAULT_PM_ALERT_TEMPLATE =
 const DEFAULT_PM_RECOVERY_TEMPLATE =
   "✅ PM en línea: {{pm_name}} (PM {{pm}}) — {{device_name}} — {{hora}}";
 
+// ---- Caché de límites ARCONEL ----
+let _arconelLimitsCache = null;
+let _arconelLimitsCachedAt = 0;
+const ARCONEL_LIMITS_TTL_MS = 5 * 60 * 1000;
+
+async function getArconelLimits() {
+  if (_arconelLimitsCache && Date.now() - _arconelLimitsCachedAt < ARCONEL_LIMITS_TTL_MS) {
+    return _arconelLimitsCache;
+  }
+  try {
+    const { rows } = await pool.query("SELECT key, value FROM arconel_limits");
+    _arconelLimitsCache = Object.fromEntries(rows.map((r) => [r.key, parseFloat(r.value)]));
+  } catch {
+    _arconelLimitsCache = _arconelLimitsCache ?? {};
+  }
+  _arconelLimitsCachedAt = Date.now();
+  return _arconelLimitsCache;
+}
+
+// Evalúa las 5 condiciones ARCONEL sobre el payload recibido.
+// Devuelve arreglo con las que están fuera de norma.
+function checkArconelConditions(payload, lim) {
+  const out = [];
+  const n = (v) => (v !== null && v !== undefined ? parseFloat(v) : null);
+
+  // 1. Factor de potencia
+  const fp = n(payload.pf_tot);
+  if (fp !== null && fp < lim.fp_min) {
+    out.push({ key: "fp", variable: "pf_tot", valor: fp, limite: lim.fp_min });
+  }
+
+  // 2. THD voltaje (cualquier fase)
+  const thdVals = [n(payload.thd_va), n(payload.thd_vb), n(payload.thd_vc)].filter((v) => v !== null);
+  if (thdVals.length > 0) {
+    const thdMax = Math.max(...thdVals);
+    if (thdMax > lim.thd_v_max) {
+      out.push({ key: "thd_v", variable: "thd_v", valor: thdMax, limite: lim.thd_v_max });
+    }
+  }
+
+  // 3. Desbalance de voltaje
+  const desbal = n(payload.desbalance_v);
+  if (desbal !== null && desbal > lim.desbal_max) {
+    out.push({ key: "desbal", variable: "desbalance_v", valor: desbal, limite: lim.desbal_max });
+  }
+
+  // 4. Frecuencia
+  const freq = n(payload.frecuencia);
+  if (freq !== null) {
+    const fMin = lim.freq_nom * (1 - lim.freq_tol / 100);
+    const fMax = lim.freq_nom * (1 + lim.freq_tol / 100);
+    if (freq < fMin || freq > fMax) {
+      out.push({ key: "freq", variable: "frecuencia", valor: freq, min: fMin.toFixed(2), max: fMax.toFixed(2) });
+    }
+  }
+
+  // 5. Voltaje por fase (cualquier fase fuera de rango)
+  const vLow  = lim.v_nom * (1 - lim.v_tol / 100);
+  const vHigh = lim.v_nom * (1 + lim.v_tol / 100);
+  const voltages = [
+    { v: n(payload.voltage_a), label: "voltage_a" },
+    { v: n(payload.voltage_b), label: "voltage_b" },
+    { v: n(payload.voltage_c), label: "voltage_c" },
+  ].filter((x) => x.v !== null);
+  if (voltages.length > 0) {
+    const fuera = voltages.find((x) => x.v < vLow || x.v > vHigh);
+    if (fuera) {
+      out.push({ key: "voltage", variable: fuera.label, valor: fuera.v, min: vLow.toFixed(1), max: vHigh.toFixed(1) });
+    }
+  }
+
+  return out;
+}
+
+// Interpola los placeholders {medidor}, {valor}, {limite}, {min}, {max} del
+// formato de mensajes de arconel_alarm_config.
+function interpolarArconel(template, vars) {
+  return template
+    .replace(/\{medidor\}/g,  String(vars.medidor ?? ""))
+    .replace(/\{valor\}/g,    String(vars.valor   ?? ""))
+    .replace(/\{limite\}/g,   String(vars.limite  ?? ""))
+    .replace(/\{min\}/g,      String(vars.min     ?? ""))
+    .replace(/\{max\}/g,      String(vars.max     ?? ""));
+}
+
+// Evalúa las alertas ARCONEL para un medidor concreto.
+// Se llama desde evaluarAlarmasParaDevice (tiempo real) y desde el sweeper global.
+async function evaluarArconelParaMedidor(meterId, organizationId, meterLabel, payload) {
+  try {
+    const limits = await getArconelLimits();
+    if (!Object.keys(limits).length) return; // sin límites configurados
+
+    const { rows: configs } = await pool.query(
+      "SELECT arconel_key, enabled, message FROM arconel_alarm_config WHERE organization_id = $1",
+      [organizationId]
+    );
+    if (!configs.length) return;
+    const cfgByKey = Object.fromEntries(configs.map((c) => [c.arconel_key, c]));
+
+    const triggered = checkArconelConditions(payload, limits);
+    const ARCONEL_KEYS = ["fp", "thd_v", "desbal", "freq", "voltage"];
+
+    for (const key of ARCONEL_KEYS) {
+      const cfg = cfgByKey[key];
+
+      // Si la alerta no está habilitada, resuelve eventos abiertos
+      if (!cfg || !cfg.enabled) {
+        await pool.query(
+          "UPDATE alarm_events SET resolved_at = now() WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL",
+          [meterId, key]
+        );
+        continue;
+      }
+
+      const condition = triggered.find((t) => t.key === key) ?? null;
+      const { rows: abiertos } = await pool.query(
+        "SELECT id, notified_at FROM alarm_events WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL LIMIT 1",
+        [meterId, key]
+      );
+      const hayAbierto = abiertos.length > 0;
+
+      if (condition && !hayAbierto) {
+        // Nuevo disparo
+        await pool.query(
+          "INSERT INTO alarm_events (alarm_rule_id, organization_id, meter_id, variable, value_at_trigger) VALUES (NULL, $1, $2, $3, $4)",
+          [organizationId, meterId, key, condition.valor]
+        );
+        const vars = { medidor: meterLabel, valor: condition.valor, limite: condition.limite, min: condition.min, max: condition.max };
+        const mensaje = interpolarArconel(cfg.message, vars);
+        await dispatch(organizationId, {}, mensaje);
+        await pool.query(
+          "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL",
+          [meterId, key]
+        );
+        console.log(`[ARCONEL] Disparo — ${key} en medidor ${meterId}: ${condition.valor}`);
+
+      } else if (!condition && hayAbierto) {
+        // Condición resuelta
+        await pool.query(
+          "UPDATE alarm_events SET resolved_at = now() WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL",
+          [meterId, key]
+        );
+        console.log(`[ARCONEL] Resuelto — ${key} en medidor ${meterId}`);
+      }
+      // condition && hayAbierto → re-notificación futura (mismo intervalo que alarm_rules)
+    }
+  } catch (e) {
+    console.error("[ARCONEL] evaluarArconelParaMedidor error:", e.message);
+  }
+}
+
 // Caché de plantillas globales (se refresca cada 5 min).
 let _templatesCache = null;
 let _templatesCachedAt = 0;
@@ -2788,7 +2939,7 @@ async function evaluarAlarmasParaDevice(deviceId, pmSlave, payload) {
       SELECT
         ar.id, ar.organization_id, ar.meter_id, ar.name,
         ar.variable, ar.operator, ar.threshold,
-        m.pm_slave, g.device_id
+        m.pm_slave, m.name AS pm_name, g.device_id
       FROM alarm_rules ar
       JOIN meters m ON m.id = ar.meter_id
       JOIN gateways g ON g.id = m.gateway_id
@@ -2802,6 +2953,28 @@ async function evaluarAlarmasParaDevice(deviceId, pmSlave, payload) {
       const raw = payload[regla.variable];
       const valor = (raw !== undefined && raw !== null) ? parseFloat(raw) : null;
       await evaluarRegla(regla, valor);
+    }
+
+    // Evaluar también alertas ARCONEL para este medidor
+    if (reglas.length > 0) {
+      const { organization_id, meter_id, pm_name } = reglas[0];
+      const label = pm_name || `${deviceId}/PM${pmSlave}`;
+      await evaluarArconelParaMedidor(meter_id, organization_id, label, payload);
+    } else {
+      // Sin reglas personalizadas: buscar meter/org directamente
+      const { rows: mInfo } = await pool.query(`
+        SELECT m.id AS meter_id, m.name AS pm_name, s.organization_id
+        FROM meters m
+        JOIN gateways g ON g.id = m.gateway_id
+        JOIN sites s ON s.id = g.site_id
+        WHERE g.device_id = $1 AND m.pm_slave = $2
+        LIMIT 1
+      `, [deviceId, pmSlave]);
+      if (mInfo.length > 0) {
+        const { meter_id, pm_name, organization_id } = mInfo[0];
+        const label = pm_name || `${deviceId}/PM${pmSlave}`;
+        await evaluarArconelParaMedidor(meter_id, organization_id, label, payload);
+      }
     }
   } catch (e) {
     console.error("[ALARM] evaluarAlarmasParaDevice error:", e.message);
@@ -2817,7 +2990,7 @@ async function evaluarAlarmas() {
       SELECT
         ar.id, ar.organization_id, ar.meter_id, ar.name,
         ar.variable, ar.operator, ar.threshold,
-        m.pm_slave, g.device_id
+        m.pm_slave, m.name AS pm_name, g.device_id
       FROM alarm_rules ar
       JOIN meters m ON m.id = ar.meter_id
       JOIN gateways g ON g.id = m.gateway_id
@@ -2835,6 +3008,26 @@ async function evaluarAlarmas() {
       const raw = latest.length ? latest[0].valor : null;
       const valor = (raw !== null && raw !== undefined) ? parseFloat(raw) : null;
       await evaluarRegla(regla, valor);
+    }
+
+    // Sweeper ARCONEL: evalúa todos los medidores con power_latest
+    const { rows: medidores } = await pool.query(`
+      SELECT DISTINCT m.id AS meter_id, m.name AS pm_name, s.organization_id, g.device_id, m.pm_slave
+      FROM meters m
+      JOIN gateways g ON g.id = m.gateway_id
+      JOIN sites s ON s.id = g.site_id
+    `);
+
+    for (const med of medidores) {
+      const { rows: latest } = await pool.query(
+        `SELECT pf_tot, thd_va, thd_vb, thd_vc, desbalance_v, frecuencia,
+                voltage_a, voltage_b, voltage_c
+         FROM power_latest WHERE device_id = $1 AND pm_slave = $2 LIMIT 1`,
+        [med.device_id, med.pm_slave]
+      );
+      if (!latest.length) continue;
+      const label = med.pm_name || `${med.device_id}/PM${med.pm_slave}`;
+      await evaluarArconelParaMedidor(med.meter_id, med.organization_id, label, latest[0]);
     }
   } catch (e) {
     console.error("[ALARM] evaluarAlarmas error:", e.message);
