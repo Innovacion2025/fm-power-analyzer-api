@@ -2647,8 +2647,9 @@ function checkArconelConditions(payload, lim) {
   const out = [];
   const n = (v) => (v !== null && v !== undefined ? parseFloat(v) : null);
 
-  // 1. Factor de potencia
-  const fp = n(payload.pf_tot);
+  // 1. Factor de potencia — valor absoluto (el FP puede ser negativo en sistemas inductivos)
+  const fpRaw = n(payload.pf_tot);
+  const fp    = fpRaw !== null ? Math.abs(fpRaw) : null;
   if (fp !== null && fp < lim.fp_min) {
     out.push({ key: "fp", variable: "pf_tot", valor: fp, limite: lim.fp_min });
   }
@@ -2696,23 +2697,33 @@ function checkArconelConditions(payload, lim) {
   return out;
 }
 
-// Interpola los placeholders {medidor}, {valor}, {limite}, {min}, {max} del
-// formato de mensajes de arconel_alarm_config.
+// Interpola los placeholders del formato de mensajes de arconel_alarm_config.
+// Soporta: {medidor}, {device_id}, {device_name}, {valor}, {limite}, {min}, {max}
 function interpolarArconel(template, vars) {
   return template
-    .replace(/\{medidor\}/g,  String(vars.medidor ?? ""))
-    .replace(/\{valor\}/g,    String(vars.valor   ?? ""))
-    .replace(/\{limite\}/g,   String(vars.limite  ?? ""))
-    .replace(/\{min\}/g,      String(vars.min     ?? ""))
-    .replace(/\{max\}/g,      String(vars.max     ?? ""));
+    .replace(/\{medidor\}/g,      String(vars.medidor      ?? ""))
+    .replace(/\{device_id\}/g,    String(vars.device_id    ?? ""))
+    .replace(/\{device_name\}/g,  String(vars.device_name  ?? ""))
+    .replace(/\{valor\}/g,        String(vars.valor        ?? ""))
+    .replace(/\{limite\}/g,       String(vars.limite       ?? ""))
+    .replace(/\{min\}/g,          String(vars.min          ?? ""))
+    .replace(/\{max\}/g,          String(vars.max          ?? ""));
 }
+
+const ARCONEL_KEY_LABELS = {
+  fp:      "Factor de potencia",
+  thd_v:   "THD de voltaje",
+  desbal:  "Desbalance de voltaje",
+  freq:    "Frecuencia",
+  voltage: "Voltaje por fase",
+};
 
 // Evalúa las alertas ARCONEL para un medidor concreto.
 // Se llama desde evaluarAlarmasParaDevice (tiempo real) y desde el sweeper global.
-async function evaluarArconelParaMedidor(meterId, organizationId, meterLabel, payload) {
+async function evaluarArconelParaMedidor(meterId, organizationId, meterLabel, deviceId, deviceName, payload) {
   try {
     const limits = await getArconelLimits();
-    if (!Object.keys(limits).length) return; // sin límites configurados
+    if (!Object.keys(limits).length) return;
 
     const { rows: configs } = await pool.query(
       "SELECT arconel_key, enabled, message FROM arconel_alarm_config WHERE organization_id = $1",
@@ -2721,13 +2732,15 @@ async function evaluarArconelParaMedidor(meterId, organizationId, meterLabel, pa
     if (!configs.length) return;
     const cfgByKey = Object.fromEntries(configs.map((c) => [c.arconel_key, c]));
 
+    const templates = await getTemplates();
+    const renotifMs = parseInt(templates.renotif_interval_minutes || "15", 10) * 60 * 1000;
+
     const triggered = checkArconelConditions(payload, limits);
     const ARCONEL_KEYS = ["fp", "thd_v", "desbal", "freq", "voltage"];
 
     for (const key of ARCONEL_KEYS) {
       const cfg = cfgByKey[key];
 
-      // Si la alerta no está habilitada, resuelve eventos abiertos
       if (!cfg || !cfg.enabled) {
         await pool.query(
           "UPDATE alarm_events SET resolved_at = now() WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL",
@@ -2743,30 +2756,59 @@ async function evaluarArconelParaMedidor(meterId, organizationId, meterLabel, pa
       );
       const hayAbierto = abiertos.length > 0;
 
+      const vars = {
+        medidor:     meterLabel,
+        device_id:   deviceId   ?? "",
+        device_name: deviceName ?? "",
+        valor:       condition?.valor,
+        limite:      condition?.limite,
+        min:         condition?.min,
+        max:         condition?.max,
+      };
+
       if (condition && !hayAbierto) {
-        // Nuevo disparo
+        // ── Nuevo disparo ──
         await pool.query(
           "INSERT INTO alarm_events (alarm_rule_id, organization_id, meter_id, variable, value_at_trigger) VALUES (NULL, $1, $2, $3, $4)",
           [organizationId, meterId, key, condition.valor]
         );
-        const vars = { medidor: meterLabel, valor: condition.valor, limite: condition.limite, min: condition.min, max: condition.max };
         const mensaje = interpolarArconel(cfg.message, vars);
         await dispatch(organizationId, {}, mensaje);
         await pool.query(
           "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL",
           [meterId, key]
         );
-        console.log(`[ARCONEL] Disparo — ${key} en medidor ${meterId}: ${condition.valor}`);
+        console.log(`[ARCONEL] Disparo — ${key} en ${deviceId}/PM${meterLabel}: ${condition.valor}`);
+
+      } else if (condition && hayAbierto) {
+        // ── Condición sigue activa — re-notificar si pasó el intervalo ──
+        const lastNotif = abiertos[0]?.notified_at;
+        const elapsed   = lastNotif ? Date.now() - new Date(lastNotif).getTime() : Infinity;
+        if (elapsed >= renotifMs) {
+          const mensaje = interpolarArconel(cfg.message, vars);
+          await dispatch(organizationId, {}, mensaje);
+          await pool.query(
+            "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL",
+            [meterId, key]
+          );
+          console.log(`[ARCONEL] Recordatorio — ${key} en ${deviceId}/PM${meterLabel}: ${condition.valor}`);
+        }
 
       } else if (!condition && hayAbierto) {
-        // Condición resuelta
+        // ── Condición resuelta — marcar y notificar ──
         await pool.query(
           "UPDATE alarm_events SET resolved_at = now() WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL",
           [meterId, key]
         );
-        console.log(`[ARCONEL] Resuelto — ${key} en medidor ${meterId}`);
+        const nombreAlerta = ARCONEL_KEY_LABELS[key] ?? key;
+        const msgResuelto =
+          `✅ RESUELTO (ARCONEL)\n` +
+          `${nombreAlerta} volvió a la norma\n` +
+          `Dispositivo: ${deviceName || deviceId} (${deviceId})\n` +
+          `Medidor: ${meterLabel}`;
+        await dispatch(organizationId, {}, msgResuelto);
+        console.log(`[ARCONEL] Resuelto — ${key} en ${deviceId}/PM${meterLabel}`);
       }
-      // condition && hayAbierto → re-notificación futura (mismo intervalo que alarm_rules)
     }
   } catch (e) {
     console.error("[ARCONEL] evaluarArconelParaMedidor error:", e.message);
@@ -2958,12 +3000,12 @@ async function evaluarAlarmasParaDevice(deviceId, pmSlave, payload) {
     // Evaluar también alertas ARCONEL para este medidor
     if (reglas.length > 0) {
       const { organization_id, meter_id, pm_name } = reglas[0];
-      const label = pm_name || `${deviceId}/PM${pmSlave}`;
-      await evaluarArconelParaMedidor(meter_id, organization_id, label, payload);
+      const label = pm_name || `PM${pmSlave}`;
+      await evaluarArconelParaMedidor(meter_id, organization_id, label, deviceId, null, payload);
     } else {
       // Sin reglas personalizadas: buscar meter/org directamente
       const { rows: mInfo } = await pool.query(`
-        SELECT m.id AS meter_id, m.name AS pm_name, s.organization_id
+        SELECT m.id AS meter_id, m.name AS pm_name, s.organization_id, g.name AS device_name
         FROM meters m
         JOIN gateways g ON g.id = m.gateway_id
         JOIN sites s ON s.id = g.site_id
@@ -2971,9 +3013,9 @@ async function evaluarAlarmasParaDevice(deviceId, pmSlave, payload) {
         LIMIT 1
       `, [deviceId, pmSlave]);
       if (mInfo.length > 0) {
-        const { meter_id, pm_name, organization_id } = mInfo[0];
-        const label = pm_name || `${deviceId}/PM${pmSlave}`;
-        await evaluarArconelParaMedidor(meter_id, organization_id, label, payload);
+        const { meter_id, pm_name, organization_id, device_name } = mInfo[0];
+        const label = pm_name || `PM${pmSlave}`;
+        await evaluarArconelParaMedidor(meter_id, organization_id, label, deviceId, device_name, payload);
       }
     }
   } catch (e) {
@@ -3012,7 +3054,8 @@ async function evaluarAlarmas() {
 
     // Sweeper ARCONEL: evalúa todos los medidores con power_latest
     const { rows: medidores } = await pool.query(`
-      SELECT DISTINCT m.id AS meter_id, m.name AS pm_name, s.organization_id, g.device_id, m.pm_slave
+      SELECT DISTINCT m.id AS meter_id, m.name AS pm_name,
+             s.organization_id, g.device_id, g.name AS device_name, m.pm_slave
       FROM meters m
       JOIN gateways g ON g.id = m.gateway_id
       JOIN sites s ON s.id = g.site_id
@@ -3026,8 +3069,8 @@ async function evaluarAlarmas() {
         [med.device_id, med.pm_slave]
       );
       if (!latest.length) continue;
-      const label = med.pm_name || `${med.device_id}/PM${med.pm_slave}`;
-      await evaluarArconelParaMedidor(med.meter_id, med.organization_id, label, latest[0]);
+      const label = med.pm_name || `PM${med.pm_slave}`;
+      await evaluarArconelParaMedidor(med.meter_id, med.organization_id, label, med.device_id, med.device_name, latest[0]);
     }
   } catch (e) {
     console.error("[ALARM] evaluarAlarmas error:", e.message);
