@@ -2498,17 +2498,17 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
     };
     const templates = await getTemplates();
 
-    let tmplKey, defaultTmpl, categoryKey;
+    let tmplKey, defaultTmpl, categoryKey, routingKey;
     if (tipo === "device_timeout" || tipo === "device_timeout_repeat") {
-      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;    categoryKey = "connectivity_device";
+      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;    categoryKey = "connectivity_device"; routingKey = "connectivity_device";
     } else if (tipo === "device_recovered") {
-      tmplKey = "device_recovery"; defaultTmpl = DEFAULT_DEVICE_RECOVERY_TEMPLATE; categoryKey = "connectivity_device";
+      tmplKey = "device_recovery"; defaultTmpl = DEFAULT_DEVICE_RECOVERY_TEMPLATE; categoryKey = "connectivity_device"; routingKey = "connectivity_device";
     } else if (tipo === "pm_offline") {
-      tmplKey = "pm_alert";        defaultTmpl = DEFAULT_PM_ALERT_TEMPLATE;        categoryKey = "connectivity_pm";
+      tmplKey = "pm_alert";        defaultTmpl = DEFAULT_PM_ALERT_TEMPLATE;        categoryKey = "connectivity_pm";     routingKey = "connectivity_pm";
     } else if (tipo === "pm_recovered") {
-      tmplKey = "pm_recovery";     defaultTmpl = DEFAULT_PM_RECOVERY_TEMPLATE;     categoryKey = "connectivity_pm";
+      tmplKey = "pm_recovery";     defaultTmpl = DEFAULT_PM_RECOVERY_TEMPLATE;     categoryKey = "connectivity_pm";     routingKey = "connectivity_pm";
     } else {
-      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;    categoryKey = "connectivity_device";
+      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;    categoryKey = "connectivity_device"; routingKey = "connectivity_device";
     }
 
     // Gatear por la categoría de conectividad de la organización.
@@ -2519,7 +2519,9 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
 
     const mensaje = interpolar(templates[tmplKey] || defaultTmpl, cVars);
 
-    await dispatch(organizationId, { gatewayId }, mensaje);
+    // Dispatch con clave de routing específica (connectivity_device o connectivity_pm)
+    // para que el enrutamiento personalizado sea por tipo de evento.
+    await dispatch(organizationId, { gatewayId, arconelKey: routingKey }, mensaje);
     console.log(`[EVENT] ${tipo} — device=${device_id} pm=${pm_slave ?? "-"}`);
     res.json({ ok: true });
   } catch (e) {
@@ -2903,6 +2905,29 @@ async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null, 
         [alarmRuleId]
       );
       canales = rows;
+    } else if (arconelKey && gatewayId) {
+      // Conectividad con tipo específico (connectivity_device / connectivity_pm)
+      // Prioridad 1: target con gateway_id + arconel_key específico
+      const { rows: specific } = await pool.query(
+        `SELECT nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
+         FROM notification_channels nc
+         JOIN notification_targets nt ON nt.channel_id = nc.id
+         WHERE nt.gateway_id = $1 AND nt.arconel_key = $2 AND nc.enabled = true`,
+        [gatewayId, arconelKey]
+      );
+      if (specific.length) {
+        canales = specific;
+      } else {
+        // Prioridad 2: target genérico de gateway (sin arconel_key)
+        const { rows: generic } = await pool.query(
+          `SELECT nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
+           FROM notification_channels nc
+           JOIN notification_targets nt ON nt.channel_id = nc.id
+           WHERE nt.gateway_id = $1 AND nt.arconel_key IS NULL AND nc.enabled = true`,
+          [gatewayId]
+        );
+        canales = generic;
+      }
     } else if (arconelKey) {
       const { rows } = await pool.query(
         `SELECT nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
