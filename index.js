@@ -2498,17 +2498,23 @@ app.post("/api/v1/ingest/connectivity-event", async (req, res) => {
     };
     const templates = await getTemplates();
 
-    let tmplKey, defaultTmpl;
+    let tmplKey, defaultTmpl, categoryKey;
     if (tipo === "device_timeout" || tipo === "device_timeout_repeat") {
-      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;
+      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;    categoryKey = "connectivity_device";
     } else if (tipo === "device_recovered") {
-      tmplKey = "device_recovery"; defaultTmpl = DEFAULT_DEVICE_RECOVERY_TEMPLATE;
+      tmplKey = "device_recovery"; defaultTmpl = DEFAULT_DEVICE_RECOVERY_TEMPLATE; categoryKey = "connectivity_device";
     } else if (tipo === "pm_offline") {
-      tmplKey = "pm_alert";        defaultTmpl = DEFAULT_PM_ALERT_TEMPLATE;
+      tmplKey = "pm_alert";        defaultTmpl = DEFAULT_PM_ALERT_TEMPLATE;        categoryKey = "connectivity_pm";
     } else if (tipo === "pm_recovered") {
-      tmplKey = "pm_recovery";     defaultTmpl = DEFAULT_PM_RECOVERY_TEMPLATE;
+      tmplKey = "pm_recovery";     defaultTmpl = DEFAULT_PM_RECOVERY_TEMPLATE;     categoryKey = "connectivity_pm";
     } else {
-      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;
+      tmplKey = "device_alert";    defaultTmpl = DEFAULT_DEVICE_ALERT_TEMPLATE;    categoryKey = "connectivity_device";
+    }
+
+    // Gatear por la categoría de conectividad de la organización.
+    if (!(await categoryEnabled(organizationId, categoryKey))) {
+      console.log(`[EVENT] ${tipo} — device=${device_id} omitido (categoría ${categoryKey} desactivada)`);
+      return res.json({ ok: true, skipped: true });
     }
 
     const mensaje = interpolar(templates[tmplKey] || defaultTmpl, cVars);
@@ -2773,7 +2779,7 @@ async function evaluarArconelParaMedidor(meterId, organizationId, meterLabel, de
           [organizationId, meterId, key, condition.valor]
         );
         const mensaje = interpolarArconel(cfg.message, vars);
-        await dispatch(organizationId, {}, mensaje);
+        await dispatch(organizationId, { arconelKey: key }, mensaje);
         await pool.query(
           "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL",
           [meterId, key]
@@ -2786,7 +2792,7 @@ async function evaluarArconelParaMedidor(meterId, organizationId, meterLabel, de
         const elapsed   = lastNotif ? Date.now() - new Date(lastNotif).getTime() : Infinity;
         if (elapsed >= renotifMs) {
           const mensaje = interpolarArconel(cfg.message, vars);
-          await dispatch(organizationId, {}, mensaje);
+          await dispatch(organizationId, { arconelKey: key }, mensaje);
           await pool.query(
             "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id IS NULL AND meter_id = $1 AND variable = $2 AND resolved_at IS NULL",
             [meterId, key]
@@ -2834,6 +2840,33 @@ async function getTemplates() {
   return _templatesCache;
 }
 
+// ---- Config por categoría de notificación (por organización) ----
+// Categorías: electrical | connectivity_device | connectivity_pm.
+// Si no hay fila para org+categoría → habilitada por defecto (comportamiento previo).
+let _catCfgCache = null;
+let _catCfgCachedAt = 0;
+const CAT_CFG_TTL_MS = 60 * 1000;
+
+async function getCategoryConfig() {
+  if (_catCfgCache && Date.now() - _catCfgCachedAt < CAT_CFG_TTL_MS) return _catCfgCache;
+  try {
+    const { rows } = await pool.query("SELECT organization_id, category_key, enabled FROM notification_category_config");
+    const m = new Map();
+    for (const r of rows) m.set(`${r.organization_id}:${r.category_key}`, r.enabled);
+    _catCfgCache = m;
+  } catch {
+    _catCfgCache = _catCfgCache ?? new Map();
+  }
+  _catCfgCachedAt = Date.now();
+  return _catCfgCache;
+}
+
+async function categoryEnabled(organizationId, categoryKey) {
+  const m = await getCategoryConfig();
+  const v = m.get(`${organizationId}:${categoryKey}`);
+  return v === undefined ? true : v; // default habilitado
+}
+
 // Reemplaza {{variable}} en la plantilla con los valores del objeto vars.
 function interpolar(template, vars) {
   return template
@@ -2850,13 +2883,14 @@ function interpolar(template, vars) {
     .replace(/\{\{tipo\}\}/g,        String(vars.tipo        ?? ""));
 }
 
-// dispatch(organizationId, { alarmRuleId, gatewayId }, mensaje)
+// dispatch(organizationId, { alarmRuleId, gatewayId, arconelKey }, mensaje)
 //
 // Orden de resolución de canales:
 //   1. Si alarmRuleId → notification_targets WHERE alarm_rule_id = ?
 //   2. Si gatewayId   → notification_targets WHERE gateway_id = ?
-//   3. Fallback       → todos los canales habilitados de la organización
-async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null } = {}, mensaje) {
+//   3. Si arconelKey  → notification_targets WHERE arconel_key = ?
+//   4. Fallback       → todos los canales habilitados de la organización
+async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null, arconelKey = null } = {}, mensaje) {
   try {
     let canales = [];
 
@@ -2867,6 +2901,15 @@ async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null }
          JOIN notification_targets nt ON nt.channel_id = nc.id
          WHERE nt.alarm_rule_id = $1 AND nc.enabled = true`,
         [alarmRuleId]
+      );
+      canales = rows;
+    } else if (arconelKey) {
+      const { rows } = await pool.query(
+        `SELECT nc.channel_type, nc.telegram_bot_token, nc.telegram_chat_id, nc.webhook_url
+         FROM notification_channels nc
+         JOIN notification_targets nt ON nt.channel_id = nc.id
+         WHERE nt.arconel_key = $1 AND nt.organization_id = $2 AND nc.enabled = true`,
+        [arconelKey, organizationId]
       );
       canales = rows;
     } else if (gatewayId) {
@@ -2930,15 +2973,18 @@ async function evaluarRegla(regla, valor) {
     );
     console.log(`[ALARM] Disparo — ${regla.name}: ${regla.variable} ${regla.operator} ${umbral} (valor: ${valor})`);
 
-    const tVars = { nombre: regla.name, variable: regla.variable, valor, umbral, operador: regla.operator, device_id: regla.device_id, pm: regla.pm_slave };
-    const templates = await getTemplates();
-    const msgAlarm = interpolar(templates.alarm || DEFAULT_ALARM_TEMPLATE, tVars);
-    await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msgAlarm);
+    // El evento se registra siempre; la notificación se gatea por la categoría "electrical".
+    if (await categoryEnabled(regla.organization_id, "electrical")) {
+      const tVars = { nombre: regla.name, variable: regla.variable, valor, umbral, operador: regla.operator, device_id: regla.device_id, pm: regla.pm_slave };
+      const templates = await getTemplates();
+      const msgAlarm = interpolar(templates.alarm || DEFAULT_ALARM_TEMPLATE, tVars);
+      await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msgAlarm);
 
-    await pool.query(
-      "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
-      [regla.id]
-    );
+      await pool.query(
+        "UPDATE alarm_events SET notified_at = now() WHERE alarm_rule_id = $1 AND resolved_at IS NULL",
+        [regla.id]
+      );
+    }
 
   } else if (condicion && hayAbierto) {
     // Condición sigue activa — re-notificar si pasó el intervalo global (configurado por super_admin).
@@ -2952,7 +2998,7 @@ async function evaluarRegla(regla, valor) {
     const templates = await getTemplates();
     const renotifMs = parseInt(templates.renotif_interval_minutes || "15", 10) * 60 * 1000;
 
-    if (elapsed >= renotifMs) {
+    if (elapsed >= renotifMs && await categoryEnabled(regla.organization_id, "electrical")) {
       const tVars = { nombre: regla.name, variable: regla.variable, valor, umbral, operador: regla.operator, device_id: regla.device_id, pm: regla.pm_slave };
       const msgReminder = interpolar(templates.reminder || DEFAULT_REMINDER_TEMPLATE, tVars);
       await dispatch(regla.organization_id, { alarmRuleId: regla.id }, msgReminder);
@@ -2981,7 +3027,7 @@ async function evaluarAlarmasParaDevice(deviceId, pmSlave, payload) {
       SELECT
         ar.id, ar.organization_id, ar.meter_id, ar.name,
         ar.variable, ar.operator, ar.threshold,
-        m.pm_slave, m.name AS pm_name, g.device_id
+        m.pm_slave, g.device_id
       FROM alarm_rules ar
       JOIN meters m ON m.id = ar.meter_id
       JOIN gateways g ON g.id = m.gateway_id
@@ -2996,43 +3042,48 @@ async function evaluarAlarmasParaDevice(deviceId, pmSlave, payload) {
       const valor = (raw !== undefined && raw !== null) ? parseFloat(raw) : null;
       await evaluarRegla(regla, valor);
     }
-
-    // Evaluar también alertas ARCONEL para este medidor
-    if (reglas.length > 0) {
-      const { organization_id, meter_id, pm_name } = reglas[0];
-      const label = pm_name || `PM${pmSlave}`;
-      await evaluarArconelParaMedidor(meter_id, organization_id, label, deviceId, null, payload);
-    } else {
-      // Sin reglas personalizadas: buscar meter/org directamente
-      const { rows: mInfo } = await pool.query(`
-        SELECT m.id AS meter_id, m.name AS pm_name, s.organization_id, g.name AS device_name
-        FROM meters m
-        JOIN gateways g ON g.id = m.gateway_id
-        JOIN sites s ON s.id = g.site_id
-        WHERE g.device_id = $1 AND m.pm_slave = $2
-        LIMIT 1
-      `, [deviceId, pmSlave]);
-      if (mInfo.length > 0) {
-        const { meter_id, pm_name, organization_id, device_name } = mInfo[0];
-        const label = pm_name || `PM${pmSlave}`;
-        await evaluarArconelParaMedidor(meter_id, organization_id, label, deviceId, device_name, payload);
-      }
-    }
   } catch (e) {
     console.error("[ALARM] evaluarAlarmasParaDevice error:", e.message);
   }
+
+  // ARCONEL: evaluación en tiempo real — completamente aislada (fire-and-forget)
+  evaluarArconelParaDeviceRT(deviceId, pmSlave, payload).catch(() => {});
 }
 
-// Sweeper global: evalúa todas las reglas habilitadas leyendo power_latest.
-// Corre cada ALARM_EVAL_INTERVAL_MS como red de seguridad (cold starts,
-// reglas creadas mientras no llegaban lecturas del device, etc.).
+// Wrapper aislado para la evaluación ARCONEL en tiempo real.
+// Corre fuera del try/catch de evaluarAlarmasParaDevice para no interferir
+// con las alarmas personalizadas en ningún caso de error.
+async function evaluarArconelParaDeviceRT(deviceId, pmSlave, payload) {
+  try {
+    const { rows: mInfo } = await pool.query(`
+      SELECT m.id AS meter_id, m.name AS pm_name,
+             s.organization_id, g.name AS device_name
+      FROM meters m
+      JOIN gateways g ON g.id = m.gateway_id
+      JOIN sites s ON s.id = g.site_id
+      WHERE g.device_id = $1 AND m.pm_slave = $2
+      LIMIT 1
+    `, [deviceId, pmSlave]);
+    if (!mInfo.length) return;
+    const { meter_id, pm_name, organization_id, device_name } = mInfo[0];
+    await evaluarArconelParaMedidor(
+      meter_id, organization_id,
+      pm_name || `PM${pmSlave}`,
+      deviceId, device_name, payload
+    );
+  } catch (e) {
+    console.error("[ARCONEL-RT] error:", e.message);
+  }
+}
+
+// Sweeper global de alarm_rules — idéntico al original, sin ARCONEL.
 async function evaluarAlarmas() {
   try {
     const { rows: reglas } = await pool.query(`
       SELECT
         ar.id, ar.organization_id, ar.meter_id, ar.name,
         ar.variable, ar.operator, ar.threshold,
-        m.pm_slave, m.name AS pm_name, g.device_id
+        m.pm_slave, g.device_id
       FROM alarm_rules ar
       JOIN meters m ON m.id = ar.meter_id
       JOIN gateways g ON g.id = m.gateway_id
@@ -3051,8 +3102,14 @@ async function evaluarAlarmas() {
       const valor = (raw !== null && raw !== undefined) ? parseFloat(raw) : null;
       await evaluarRegla(regla, valor);
     }
+  } catch (e) {
+    console.error("[ALARM] evaluarAlarmas error:", e.message);
+  }
+}
 
-    // Sweeper ARCONEL: evalúa todos los medidores con power_latest
+// Sweeper ARCONEL — completamente separado, su propio timer y try/catch.
+async function evaluarArconelSweeper() {
+  try {
     const { rows: medidores } = await pool.query(`
       SELECT DISTINCT m.id AS meter_id, m.name AS pm_name,
              s.organization_id, g.device_id, g.name AS device_name, m.pm_slave
@@ -3070,10 +3127,13 @@ async function evaluarAlarmas() {
       );
       if (!latest.length) continue;
       const label = med.pm_name || `PM${med.pm_slave}`;
-      await evaluarArconelParaMedidor(med.meter_id, med.organization_id, label, med.device_id, med.device_name, latest[0]);
+      await evaluarArconelParaMedidor(
+        med.meter_id, med.organization_id, label,
+        med.device_id, med.device_name, latest[0]
+      );
     }
   } catch (e) {
-    console.error("[ALARM] evaluarAlarmas error:", e.message);
+    console.error("[ARCONEL-SWEEP] error:", e.message);
   }
 }
 
@@ -3094,4 +3154,9 @@ app.listen(PORT, async () => {
   evaluarAlarmas();
   setInterval(evaluarAlarmas, ALARM_EVAL_INTERVAL_MS);
   console.log(`Evaluador de alarmas activo (cada ${ALARM_EVAL_INTERVAL_MS / 1000}s)`);
+
+  // ARCONEL sweeper — timer independiente para no afectar el evaluador principal
+  evaluarArconelSweeper();
+  setInterval(evaluarArconelSweeper, ALARM_EVAL_INTERVAL_MS);
+  console.log(`Evaluador ARCONEL activo (cada ${ALARM_EVAL_INTERVAL_MS / 1000}s)`);
 });
