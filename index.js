@@ -2948,15 +2948,9 @@ async function dispatch(organizationId, { alarmRuleId = null, gatewayId = null, 
       canales = rows;
     }
 
-    if (!canales.length) {
-      const { rows } = await pool.query(
-        `SELECT channel_type, telegram_bot_token, telegram_chat_id, webhook_url
-         FROM notification_channels
-         WHERE organization_id = $1 AND enabled = true`,
-        [organizationId]
-      );
-      canales = rows;
-    }
+    // Sin asignación explícita → no se envía a ningún canal.
+    // El usuario debe asignar canales en la pestaña "Asignación".
+    if (!canales.length) return;
 
     for (const ch of canales) {
       if (ch.channel_type === "telegram" && ch.telegram_bot_token && ch.telegram_chat_id) {
